@@ -1,26 +1,33 @@
 #!/usr/bin/env python3
-"""
-Simple Pomodoro app inspired by spt project.
-The app designed to be used with i3blocks.
-"""
+#
+# A pomodoro blocklet script for i3blocks.
+#
+# Copyright (C) 2019 gitbaby
+#
+# This program is free software: you can redistribute it and/or modify
+# it under the terms of the GNU General Public License as published by
+# the Free Software Foundation, either version 3 of the License, or
+# (at your option) any later version.
+#
+# This program is distributed in the hope that it will be useful,
+# but WITHOUT ANY WARRANTY; without even the implied warranty of
+# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+# GNU General Public License for more details.
+#
+# You should have received a copy of the GNU General Public License
+# along with this program.  If not, see <https://www.gnu.org/licenses/>.
+
+import itertools
 import os
 import socket
-from itertools import cycle
+import sys
 from subprocess import call
 from time import sleep
 from threading import Thread
 
 
 def notify(text):
-    call(["notify-send", "Pomodoro", text])
-
-
-def daemonize():
-    if os.fork() > 0:
-        exit()
-    os.setsid()
-    if os.fork() > 0:
-        exit()
+    call(['notify-send', 'Pomodoro', text])
 
 
 class AlredyStartedError(Exception):
@@ -29,67 +36,96 @@ class AlredyStartedError(Exception):
 
 class Cycle:
     def __init__(self, items):
-        self._items = items
+        self.items = items
+        self._index = 0
+        self._last_index = len(items) - 1
         self._iter = None
         self.reset()
 
     def reset(self):
-        self._iter = cycle(self._items)
+        self._index = 0
+        self._iter = itertools.cycle(self.items)
 
     def __iter__(self):
         return self
 
     def __next__(self):
+        if self._index < self._last_index:
+            self._index += 1
+        else:
+            self._index = 0
         return next(self._iter)
+
+    def current(self):
+        return self.items[self._index]
 
 
 class Pomodoro:
     def __init__(self, cycle):
         self._cycle = cycle
-        self._state = "Paused"
-        self._remaining = 0
-        self._do_reset = False
+        is_break, timeout, phase, _ = cycle.current()
+        self._is_break = is_break
+        self._remaining = timeout * 60
+        self._phase = phase
+        self._color = 'FF0000'
         self._running = False
+        self._stop = False
 
     @property
     def state(self):
-        state = self._state
-        if not self._running:
-            state = "Paused"
         minutes, seconds = divmod(self._remaining, 60)
-        return "{0} {1:02d}:{2:02d}".format(state, minutes, seconds)
+        return '{0} {1:02d}:{2:02d}\n\n#{3}'.format(self._phase, minutes, seconds, self._color)
 
     def toggle(self):
         self._running = not self._running
+        if self._running:
+            self._color = 'FFFF00' if self._is_break else '00FF00'
+        else:
+            self._color = 'FFFF00'
+
+    def skip(self):
+        self._stop = True
+        self._end_of_cycle()
+        is_break, timeout, phase, _ = self._cycle.current()
+        self._is_break = is_break
+        self._remaining = timeout * 60
+        self._phase = phase
 
     def reset(self):
-        self._do_reset = True
+        self._stop = True
+        self._end_of_cycle()
         self._cycle.reset()
+        is_break, timeout, phase, _ = self._cycle.current()
+        self._is_break = is_break
+        self._remaining = timeout * 60
+        self._phase = phase
 
     def start(self):
-        for timeout, state, message in self._cycle:
-            if self._do_reset:
-                self._do_reset = False
-
-            if self._running:
-                self._state = state
-                notify(message)
-
+        for is_break, timeout, phase, message in self._cycle:
+            self._stop = False
+            self._is_break = is_break
             self._remaining = timeout * 60
-            while self._remaining:
-                if self._do_reset:
-                    break
+            self._phase = phase
+            while self._remaining > 0 and not self._stop:
                 sleep(1)
                 if self._running:
                     self._remaining -= 1
-                    self._state = state
+            if self._running:
+                self._end_of_cycle()
+                if message:
+                    notify(message)
+
+    def _end_of_cycle(self):
+        self._running = False
+        self._color = 'FF0000'
 
 
 class App:
-    ADDRESS = "\0pomodoro"
-    PAUSE = b"pause"
-    RESET = b"reset"
-    DISPLAY = b"display"
+    ADDRESS = '\0pomodoro'
+    PAUSE = b'pause'
+    SKIP = b'skip'
+    RESET = b'reset'
+    DISPLAY = b'display'
 
     def __init__(self, pomodoro):
         self._thread = Thread(target=self._handle_connections)
@@ -102,7 +138,12 @@ class App:
         except socket.error:
             raise AlredyStartedError()
 
-        daemonize()
+        if os.fork() > 0:
+            print(self._pomodoro.state)
+            sys.exit()
+        os.setsid()
+        if os.fork() > 0:
+            sys.exit()
 
         Thread(target=self._pomodoro.start).start()
         self._handle_connections()
@@ -113,25 +154,31 @@ class App:
     def toggle(self):
         self._send(self.PAUSE)
 
+    def skip(self):
+        self._send(self.SKIP)
+
     def reset(self):
         self._send(self.RESET)
 
     def _send(self, command):
         self._sock.connect(self.ADDRESS)
         self._sock.sendall(command)
-        print(self._sock.recv(32).decode("utf-8"))
+        print(self._sock.recv(32).decode('utf-8'))
 
     def _handle_connections(self):
         self._sock.listen()
         while True:
             conn, _ = self._sock.accept()
             command = conn.recv(16)
-            if command == self.PAUSE:
+            if command == self.DISPLAY:
+                pass
+            elif command == self.PAUSE:
                 self._pomodoro.toggle()
+            elif command == self.SKIP:
+                self._pomodoro.skip()
             elif command == self.RESET:
                 self._pomodoro.reset()
-
-            conn.sendall(self._pomodoro.state.encode("utf-8"))
+            conn.sendall(self._pomodoro.state.encode('utf-8'))
             conn.close()
 
 
@@ -139,28 +186,31 @@ app = App(
     Pomodoro(
         Cycle(
             [
-                (25, "Working", "Time to start working!"),
-                (5, "Resting", "Time to start resting!"),
-                (25, "Working", "Time to start working!"),
-                (5, "Resting", "Time to start resting!"),
-                (25, "Working", "Time to start working!"),
-                (5, "Resting", "Time to start resting!"),
-                (25, "Working", "Time to start working!"),
-                (15, "Long Break", "Time to take some nap!"),
+                (0, 25, 'Pomodoro 1', 'Take a short break'),
+                (1, 5, 'Break 1', 'End of break'),
+                (0, 25, 'Pomodoro 2', 'Take a short break'),
+                (1, 5, 'Break 2', 'End of break'),
+                (0, 25, 'Pomodoro 3', 'Take a short break'),
+                (1, 5, 'Break 3', 'End of break'),
+                (0, 25, 'Pomodoro 4', 'Take a longer break'),
+                (1, 15, 'Break 4', 'End of break'),
             ]
         )
     )
 )
 
 
-if __name__ == "__main__":
+if __name__ == '__main__':
     try:
         app.run()
     except AlredyStartedError:
-        button = os.getenv("BLOCK_BUTTON", "").lower()
-        if button == "1":
+        button = os.getenv('BLOCK_BUTTON', '').lower()
+        if button == '1':
             app.toggle()
-        elif button == "3":
+        elif button == '2':
             app.reset()
+        elif button == '3':
+            app.skip()
         else:
             app.display()
+
